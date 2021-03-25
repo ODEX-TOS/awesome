@@ -15,27 +15,33 @@ NC='\033[0m' # No Color
 
 root_dir="/etc/xdg/tde"
 current_dir="$root_dir"
+TDE_READLINE_LOCATION="$root_dir/readline.sh"
+TDE_READLINE_LOCATION="tde_readline.sh"
 
-
-if [ -t 0 ]  # is a tty.
+if [[ -t 0  && "$1" == "-c" || "$1" == "--compatibility" ]]  # is a tty and readline is enabled
 then
     # rlwrap provides readline functionality for "read", which is more enhanced
     # than bash's "read" itself.
-    # It can be disabled/overridden using 'AWESOME_RLWRAP= tde-client'.
-    if [ -z "${AWESOME_RLWRAP+x}" ]; then
-        AWESOME_RLWRAP="$(which rlwrap 2>/dev/null)"
+    # It can be disabled/overridden using 'TDE_RLWRAP= tde-client'.
+    if [ -z "${TDE_RLWRAP+x}" ]; then
+        TDE_RLWRAP="$(which rlwrap 2>/dev/null)"
     fi
-    if [ -n "$AWESOME_RLWRAP" ]
+    if [ -n "$TDE_RLWRAP" ]
     then
         if [ "$A_RERUN" = "" ]
         then
-            A_RERUN="no" exec "$AWESOME_RLWRAP" "$0" "$@"
+            A_RERUN="no" exec "$TDE_RLWRAP" "$0" "$@"
         fi
         READ_ARGS=""
     else
         # No rlwrap: use bash's readline.
         READ_ARGS="-e"
     fi
+fi
+
+# check if compatibility mode is enabled, otherwise we use the tde_readline package
+if [[ "$1" != "-c" && "$1" != "--compatibility" && -f "$TDE_READLINE_LOCATION" ]]; then
+    source "$TDE_READLINE_LOCATION"
 fi
 
 DBUS_SEND=dbus-send
@@ -80,13 +86,17 @@ print_greetings()
 print_help()
 {
     clear
-    echo -e "Usage: ${ORANGE}tde-client${NC} [${BLUE}-h${NC} | ${BLUE}--help${NC} ] [${BLUE}command${NC} [${BLUE}command${RED}...${NC}]]
+    echo -e "Usage: ${ORANGE}tde-client${NC} [${BLUE}-h${NC} | ${BLUE}--help${NC} | ${BLUE}-c${NC} | ${BLUE}--compatibility${NC} ] [${BLUE}command${NC} [${BLUE}command${RED}...${NC}]]
 tos desktop environment remote execution
 
 ${ORANGE}tde-client${NC} is a remote command line interface to TDE.
 It communicates with TDE via D-Bus, allowing remote execution of Lua code.
 
 This code gets ran in a protected mode, making sure you can't crash the desktop environment.
+
+When ran with the ${BLUE}--compatibility${NC} option we use the readline package to read user input.
+By default we use the ${LBLUE}TDE${NC} implementation which support colorization and code completion.
+Some old terminal emulators such as ${LBLUE}getty${NC} don't support these features, thus you need the compatibility option
 
 Run without a command to enter ${LBLUE}REPL${NC} (read-eval-print-loop) mode.
 If you are in ${LBLUE}REPL${NC} mode these are the available commands:
@@ -150,7 +160,106 @@ The Lua specific documentation: ${LBLUE}https://www.lua.org/manual/5.3/${NC}
 "
 }
 
-if [ $# -ne 0 ]
+# The callback function when typing (used for colorizing)
+function tde_repl_line_callback() {
+    echo -en "$1" | lua "$root_dir"/pretty_print.lua
+}
+
+results=("_G -- the global scope" "help -- show the help message" "examples -- show some common examples"
+    "exit -- stop the repl" "cat -- show the source code for a given file" "logs -- show the last 10 lines in the tde logs"
+    "cd -- change directory" "pwd -- show the current directory" "ls -- show all files in the current working directory")
+
+# currently a simple code completion engine
+function tde_repl_code_completion() {
+    # TODO: write a completion engine and use that instead (when valid lua is found)
+    tde_code_completion_results=()
+    # add some of the default completions
+    for item in "${results[@]}"; do
+        if [[ "$item" == "$1"* ]]; then
+            tde_code_completion_results+=( "$item" )
+        fi
+    done
+
+    local var="$(echo $1 | rev | cut -d "." -f2- | rev)"
+    local matcher="$(echo $1 | rev | cut -d "." -f1 | rev)"
+    local res="$(a_dbus_send '
+    cc_result = {}
+    for key, value in pairs('$var') do
+        table.insert(cc_result, key)
+    end
+    return cc_result
+    ' | sed -E -e "1d"  -e "s/[0-9]+: '(.*)',/\1/g" -e '$d')"
+
+    local i="0"
+
+    for item in $res; do
+        if [[ "$item" == "$matcher"* ]]; then
+            tde_code_completion_results+=( "${var}.${item} -- property of $var" )
+        fi
+    done
+}
+
+# The line the user wants to execute goes here
+function tde_execute_repl() {
+    # TODO: trim trailing -- and whitespace
+    local line="$(echo $1 | sed -e 's/--.*$//g' -e 's/ $//g')"
+    # gracefull shutdown
+    if [ "$line" == "exit" ] || [ "$line" == "exit()" ] || [ "$line" == "quit" ] || [ "$line" == "quit()" ]; then
+        exit 0
+    elif [ "$line" == "help" ] || [ "$line" == "help()" ]; then
+        print_help
+        return
+    elif [ "$line" == "example" ] || [ "$line" == "examples" ] || [ "$line" == "example()" ] || [ "$line" == "examples()" ]; then
+        print_example
+        return
+    elif [ "$line" == "logs" ]; then
+        tail "$HOME/.cache/tde/stdout.log"
+    elif [[ "$line" == "logs "* ]]; then
+        lines="$(echo "$line" | cut -d " " -f2- )"
+        tail -n "$lines" "$HOME/.cache/tde/stdout.log"
+    elif [[ "$line" == "cat "* ]]; then
+        file="$(echo "$line" | cut -d " " -f2- )"
+        content="$(/bin/cat "$file" 2>/dev/null || /bin/cat "$current_dir/$file")"
+        echo -e "$content" | lua "$root_dir"/pretty_print.lua
+        return
+    elif [ -f "$line" ] || [ -f "$current_dir/$line" ]; then
+        content="$(/bin/cat "$line" 2>/dev/null || /bin/cat "$current_dir/$line")"
+        res="$(a_dbus_send "$content")"
+        echo -e "$content" | lua "$root_dir"/pretty_print.lua
+        echo
+    elif [[ "$line" == "ls "* ]]; then
+        ls "$current_dir/$(echo "$line" | cut -d " " -f2- )"
+    elif [[ "$line" == "ls" ]]; then
+        ls "$current_dir/"
+    elif [[ "$line" == "cd" ]]; then
+        current_dir="$root_dir"
+        return
+    elif [[ "$line" == "cd "* ]]; then
+        new_dir="$current_dir/$(echo "$line" | cut -d " " -f2- )"
+        if [[ -d "$new_dir" ]]; then
+            current_dir="$(realpath $new_dir)"
+        fi
+        return
+    elif [[ "$line" == "pwd" ]]; then
+        echo "$current_dir"
+        return
+    # don't use the return keyword when '=' is used, when '==' is used, do use return
+    elif echo "$line" | grep -q "[^=]=[^=]"; then
+        res="$(a_dbus_send "$line")"
+    else
+        res="$(a_dbus_send "return $line")"
+    fi
+
+    if echo -e "$res" | grep -q "Error during execution: "; then
+        line_feed="$line_feed_failed"
+        TDE_REPL_EXIT_CODE="1"
+    else
+        TDE_REPL_EXIT_CODE="0"
+    fi
+    echo -e "$res" | lua "$root_dir"/pretty_print.lua
+}
+
+if [[ $# -ne 0 && "$1" != "-c" && "$1" != "--compatibility" ]]
 then
     # check for command-line arguments
     ARGS=()
@@ -166,12 +275,12 @@ then
     for arg in "${ARGS[@]}"; do
         a_dbus_send "$arg"
     done
-elif [ -t 0 ]
+elif [[ -t 0  && "$1" == "-c" || "$1" == "--compatibility" ]]
 then
     FATAL_ERRORS=0
     print_greetings
     line_feed_success="tde ${GREEN}➡${NC} "
-    line_feed_failed="$tde ${RED}➡${NC} "
+    line_feed_failed="tde ${RED}➡${NC} "
     line_feed="$line_feed_success"
     while { echo -en "$line_feed" ; read $READ_ARGS -r line; }
     do
@@ -180,61 +289,15 @@ then
         if [ "$line" = "" ]; then
             continue
         fi
-        # gracefull shutdown
-        if [ "$line" == "exit" ] || [ "$line" == "exit()" ] || [ "$line" == "quit" ] || [ "$line" == "quit()" ]; then
-            exit 0
-        elif [ "$line" == "help" ] || [ "$line" == "help()" ]; then
-            print_help
-            continue
-        elif [ "$line" == "example" ] || [ "$line" == "examples" ] || [ "$line" == "example()" ] || [ "$line" == "examples()" ]; then
-            print_example
-            continue
-        elif [ "$line" == "logs" ]; then
-            tail "$HOME/.cache/tde/stdout.log"
-        elif [[ "$line" == "logs "* ]]; then
-            lines="$(echo "$line" | cut -d " " -f2- )"
-            tail -n "$lines" "$HOME/.cache/tde/stdout.log"
-        elif [[ "$line" == "cat "* ]]; then
-            file="$(echo "$line" | cut -d " " -f2- )"
-            content="$(/bin/cat "$file" 2>/dev/null || /bin/cat "$current_dir/$file")"
-            echo -e "$content" | lua "$root_dir"/pretty_print.lua
-            continue
-        elif [ -f "$line" ] || [ -f "$current_dir/$line" ]; then
-            content="$(/bin/cat "$line" 2>/dev/null || /bin/cat "$current_dir/$line")"
-            res="$(a_dbus_send "$content")"
-            echo -e "$content" | lua "$root_dir"/pretty_print.lua
-            echo
-        elif [[ "$line" == "ls "* ]]; then
-            ls "$current_dir/$(echo "$line" | cut -d " " -f2- )"
-        elif [[ "$line" == "ls" ]]; then
-            ls "$current_dir/"
-        elif [[ "$line" == "cd" ]]; then
-            current_dir="$root_dir"
-            continue
-        elif [[ "$line" == "cd "* ]]; then
-            new_dir="$current_dir/$(echo "$line" | cut -d " " -f2- )"
-            if [[ -d "$new_dir" ]]; then
-                current_dir="$(realpath $new_dir)"
-            fi
-            continue
-        elif [[ "$line" == "pwd" ]]; then
-            echo "$current_dir"
-            continue
-        # don't use the return keyword when '=' is used, when '==' is used, do use return
-        elif echo "$line" | grep -q "[^=]=[^=]"; then
-            res="$(a_dbus_send "$line")"
-        else
-            res="$(a_dbus_send "return $line")"
-        fi
 
-
-        if echo -e "$res" | grep -q "Error during execution: "; then
-            line_feed="$line_feed_failed"
-        fi
         echo -e "$line" | lua "$root_dir"/pretty_print.lua
-        echo
-        echo -e "$res" | lua "$root_dir"/pretty_print.lua
+        tde_execute_repl "$line"
     done
+elif [ -t 0 ]
+then
+    print_greetings
+    # start repl mode
+    tde_repl_start
 else
     a_dbus_send "$(cat)"
 fi
